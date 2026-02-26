@@ -3,6 +3,7 @@ use env_logger;
 use gdal::{Dataset, DriverManager};
 use gdal::raster::Buffer;
 use gdal::spatial_ref::{CoordTransform, SpatialRef};
+use image::ImageBuffer;
 use log::{debug, error, info, warn};
 use serde::Serialize;
 use std::fs::File;
@@ -578,6 +579,14 @@ fn run_mode1(
     let run_meta = RunMetadata { tiles: tiles_meta.clone(), resolution_m, grid_origin };
     info!("Generated {} tiles total (in metadata)", tiles_meta.len());
     write_metadata(output_dir, metadata_file, &run_meta)?;
+    
+    // Generate PNG preview of the selected area
+    generate_area_preview(&ds, &gt, area_top_left_px, area_top_left_py, area_width_px, area_height_px, output_dir)?;
+    
+    // Generate overlay showing selection and tiles on original data
+    generate_selection_overlay(&ds, area_top_left_px, area_top_left_py, area_width_px, area_height_px, 
+                             tile_px, tiles_x, tiles_y, output_dir)?;
+    
     info!("Mode1 finished successfully");
     Ok(())
 }
@@ -791,6 +800,14 @@ fn run_mode2(
     let run_meta = RunMetadata { tiles: tiles_meta.clone(), resolution_m, grid_origin };
     info!("Generated {} tiles total (in metadata)", tiles_meta.len());
     write_metadata(output_dir, metadata_file, &run_meta)?;
+    
+    // Generate PNG preview of the selected area
+    generate_area_preview(&ds, &gt, area_top_left_px, area_top_left_py, total_px_x, total_px_y, output_dir)?;
+    
+    // Generate overlay showing selection and tiles on original data
+    generate_selection_overlay(&ds, area_top_left_px, area_top_left_py, total_px_x, total_px_y,
+                             tile_px, tiles_x, tiles_y, output_dir)?;
+    
     info!("Mode2 finished successfully");
     Ok(())
 }
@@ -808,5 +825,321 @@ fn write_metadata(
     let json = serde_json::to_string_pretty(run_meta).map_err(|e| e.to_string())?;
     f.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
     info!("Metadata written successfully");
+    Ok(())
+}
+
+/// Generate a PNG preview of the selected area from the dataset
+fn generate_area_preview(
+    ds: &Dataset,
+    _gt: &[f64; 6],
+    x_off: isize,
+    y_off: isize,
+    width: isize,
+    height: isize,
+    output_dir: &PathBuf,
+) -> Result<(), String> {
+    info!("Generating PNG preview of selected area with hillshade");
+    
+    let (src_w, src_h) = ds.raster_size();
+    
+    // Clamp the area to dataset bounds
+    let x_start = x_off.max(0).min(src_w as isize - 1) as isize;
+    let y_start = y_off.max(0).min(src_h as isize - 1) as isize;
+    let x_end = (x_off + width).min(src_w as isize).max(0) as isize;
+    let y_end = (y_off + height).min(src_h as isize).max(0) as isize;
+    
+    let preview_width = (x_end - x_start).max(1) as usize;
+    let preview_height = (y_end - y_start).max(1) as usize;
+    
+    // Scale down if too large for preview
+    let (display_width, display_height) = if preview_width > 2000 || preview_height > 2000 {
+        let scale = ((preview_width as f64).max(preview_height as f64) / 2000.0).ceil() as usize;
+        (preview_width / scale, preview_height / scale)
+    } else {
+        (preview_width, preview_height)
+    };
+    
+    info!("Reading preview area: {:.0} x {:.0} pixels at offset ({}, {})", 
+          display_width, display_height, x_start, y_start);
+    
+    // Read the first band as elevation/terrain data
+    let band1 = ds.rasterband(1).map_err(|e| e.to_string())?;
+    let buffer: Buffer<f32> = band1
+        .read_as(
+            (x_start, y_start),
+            (preview_width, preview_height),
+            (display_width, display_height),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    
+    let data = buffer.data();
+    let min_val = data.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max_val = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let range = if (max_val - min_val).abs() > 0.001 {
+        max_val - min_val
+    } else {
+        1.0
+    };
+    
+    info!("Data range: {:.2} to {:.2}", min_val, max_val);
+    
+    // Compute hillshade
+    let mut img = ImageBuffer::new(display_width as u32, display_height as u32);
+    
+    // Hillshade parameters
+    let azimuth = 315.0_f32.to_radians(); // Light from upper left
+    let altitude = 45.0_f32.to_radians(); // 45 degree angle
+    let z_factor = 10.0_f32; // Vertical exaggeration
+    
+    // Store shade values for normalization
+    let mut shades = vec![0.0_f32; display_width * display_height];
+    let mut min_shade = f32::INFINITY;
+    let mut max_shade = f32::NEG_INFINITY;
+    
+    for y in 0..display_height {
+        for x in 0..display_width {
+            let idx = y * display_width + x;
+            
+            // Get center elevation (normalized)
+            let center = if idx < data.len() {
+                (data[idx] - min_val) / range
+            } else {
+                0.0
+            };
+            
+            // Get neighboring elevations using Sobel operators
+            let tl = if x > 0 && y > 0 && (y - 1) * display_width + (x - 1) < data.len() {
+                (data[(y - 1) * display_width + (x - 1)] - min_val) / range
+            } else {
+                center
+            };
+            
+            let tr = if x < display_width - 1 && y > 0 && (y - 1) * display_width + (x + 1) < data.len() {
+                (data[(y - 1) * display_width + (x + 1)] - min_val) / range
+            } else {
+                center
+            };
+            
+            let bl = if x > 0 && y < display_height - 1 && (y + 1) * display_width + (x - 1) < data.len() {
+                (data[(y + 1) * display_width + (x - 1)] - min_val) / range
+            } else {
+                center
+            };
+            
+            let br = if x < display_width - 1 && y < display_height - 1 && (y + 1) * display_width + (x + 1) < data.len() {
+                (data[(y + 1) * display_width + (x + 1)] - min_val) / range
+            } else {
+                center
+            };
+            
+            let left = if x > 0 && y * display_width + (x - 1) < data.len() {
+                (data[y * display_width + (x - 1)] - min_val) / range
+            } else {
+                center
+            };
+            
+            let right = if x < display_width - 1 && y * display_width + (x + 1) < data.len() {
+                (data[y * display_width + (x + 1)] - min_val) / range
+            } else {
+                center
+            };
+            
+            let top = if y > 0 && (y - 1) * display_width + x < data.len() {
+                (data[(y - 1) * display_width + x] - min_val) / range
+            } else {
+                center
+            };
+            
+            let bottom = if y < display_height - 1 && (y + 1) * display_width + x < data.len() {
+                (data[(y + 1) * display_width + x] - min_val) / range
+            } else {
+                center
+            };
+            
+            // Sobel operators for better gradients
+            let dx = (-tl + tr - 2.0 * left + 2.0 * right - bl + br) * z_factor / 8.0;
+            let dy = (-tl - 2.0 * top - tr + bl + 2.0 * bottom + br) * z_factor / 8.0;
+            
+            // Compute surface normal
+            let nx = -dx;
+            let ny = -dy;
+            let nz = 1.0_f32;
+            
+            let norm = (nx * nx + ny * ny + nz * nz).sqrt();
+            let nx = nx / norm;
+            let ny = ny / norm;
+            let nz = nz / norm;
+            
+            // Light direction (from altitude and azimuth)
+            let lx = altitude.cos() * azimuth.sin();
+            let ly = altitude.cos() * azimuth.cos();
+            let lz = altitude.sin();
+            
+            // Compute shading (dot product of normal and light direction)
+            let shade = nx * lx + ny * ly + nz * lz;
+            
+            shades[idx] = shade;
+            min_shade = min_shade.min(shade);
+            max_shade = max_shade.max(shade);
+        }
+    }
+    
+    // Normalize shades and render
+    let shade_range = if (max_shade - min_shade).abs() > 0.001 {
+        max_shade - min_shade
+    } else {
+        1.0
+    };
+    
+    info!("Shade range: {:.4} to {:.4}", min_shade, max_shade);
+    
+    for y in 0..display_height {
+        for x in 0..display_width {
+            let idx = y * display_width + x;
+            let normalized_shade = (shades[idx] - min_shade) / shade_range;
+            // Apply contrast boost using power function
+            let boosted = normalized_shade.powf(0.7);
+            let gray = ((boosted * 255.0).clamp(0.0, 255.0)) as u8;
+            *img.get_pixel_mut(x as u32, y as u32) = image::Luma([gray]);
+        }
+    }
+    
+    // Save PNG
+    let preview_path = output_dir.join("area_preview.png");
+    img.save(&preview_path).map_err(|e| e.to_string())?;
+    info!("PNG hillshade preview saved to {}", preview_path.display());
+    
+    Ok(())
+}
+
+/// Generate a PNG showing the original data with the selected area marked as a red rectangle and tiles as white grid
+fn generate_selection_overlay(
+    ds: &Dataset,
+    x_off: isize,
+    y_off: isize,
+    width: isize,
+    height: isize,
+    tile_px: isize,
+    tiles_x: i32,
+    tiles_y: i32,
+    output_dir: &PathBuf,
+) -> Result<(), String> {
+    info!("Generating selection overlay PNG with tiles");
+    
+    let (src_w, src_h) = ds.raster_size();
+    
+    // Scale down if too large for preview
+    let (display_width, display_height) = if src_w > 2000 || src_h > 2000 {
+        let scale = ((src_w as f64).max(src_h as f64) / 2000.0).ceil() as usize;
+        ((src_w as usize) / scale, (src_h as usize) / scale)
+    } else {
+        (src_w as usize, src_h as usize)
+    };
+    
+    info!("Creating overlay with full dataset view: {} x {} pixels", display_width, display_height);
+    
+    // Read the first band
+    let band1 = ds.rasterband(1).map_err(|e| e.to_string())?;
+    let buffer: Buffer<f32> = band1
+        .read_as(
+            (0, 0),
+            (src_w as usize, src_h as usize),
+            (display_width, display_height),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    
+    let data = buffer.data();
+    let min_val = data.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max_val = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let range = if (max_val - min_val).abs() > 0.001 {
+        max_val - min_val
+    } else {
+        1.0
+    };
+    
+    info!("Data range: {:.2} to {:.2}", min_val, max_val);
+    
+    // Create RGBA image from the grayscale data (for drawing operations)
+    let mut img: image::RgbaImage = ImageBuffer::new(display_width as u32, display_height as u32);
+    for (x, y, pixel) in img.enumerate_pixels_mut() {
+        let idx = (y as usize * display_width + x as usize) as usize;
+        if idx < data.len() {
+            let normalized = ((data[idx] - min_val) / range * 255.0).clamp(0.0, 255.0) as u8;
+            *pixel = image::Rgba([normalized, normalized, normalized, 255]);
+        }
+    }
+    
+    // Calculate the scaled selection rectangle (red)
+    let scale_factor = display_width as f64 / src_w as f64;
+    let rect_x = (x_off as f64 * scale_factor).round() as i32;
+    let rect_y = (y_off as f64 * scale_factor).round() as i32;
+    let rect_width = (width as f64 * scale_factor).round() as u32;
+    let rect_height = (height as f64 * scale_factor).round() as u32;
+    
+    info!("Drawing selection rectangle at ({}, {}) with size {} x {}", 
+          rect_x, rect_y, rect_width, rect_height);
+    
+    // Draw selection rectangle in red
+    let red = image::Rgba([255u8, 0u8, 0u8, 255u8]);
+    let rect_x_clamp = rect_x.max(0) as u32;
+    let rect_y_clamp = rect_y.max(0) as u32;
+    let rect_x_max = ((rect_x as u32 + rect_width).min(display_width as u32)) as i32;
+    let rect_y_max = ((rect_y as u32 + rect_height).min(display_height as u32)) as i32;
+    
+    // Draw top and bottom lines
+    for x in rect_x_clamp..(rect_x_max.max(0) as u32).min(display_width as u32) {
+        if rect_y >= 0 && rect_y < display_height as i32 {
+            *img.get_pixel_mut(x, rect_y as u32) = red;
+        }
+        if rect_y_max > 0 && rect_y_max < display_height as i32 {
+            *img.get_pixel_mut(x, rect_y_max as u32) = red;
+        }
+    }
+    
+    // Draw left and right lines
+    for y in rect_y_clamp..(rect_y_max.max(0) as u32).min(display_height as u32) {
+        if rect_x >= 0 && rect_x < display_width as i32 {
+            *img.get_pixel_mut(rect_x as u32, y) = red;
+        }
+        if rect_x_max > 0 && rect_x_max < display_width as i32 {
+            *img.get_pixel_mut(rect_x_max as u32, y) = red;
+        }
+    }
+    
+    // Draw tile grid in white
+    let white = image::Rgba([255u8, 255u8, 255u8, 255u8]);
+    let tile_px_scaled = (tile_px as f64 * scale_factor) as i32;
+    
+    // Draw vertical grid lines
+    for col in 1..tiles_x {
+        let x_pos = rect_x + col as i32 * tile_px_scaled;
+        if x_pos >= 0 && x_pos < display_width as i32 {
+            for y in rect_y_clamp..(rect_y_max.max(0) as u32).min(display_height as u32) {
+                if x_pos >= 0 && x_pos < display_width as i32 {
+                    *img.get_pixel_mut(x_pos as u32, y) = white;
+                }
+            }
+        }
+    }
+    
+    // Draw horizontal grid lines
+    for row in 1..tiles_y {
+        let y_pos = rect_y + row as i32 * tile_px_scaled;
+        if y_pos >= 0 && y_pos < display_height as i32 {
+            for x in rect_x_clamp..(rect_x_max.max(0) as u32).min(display_width as u32) {
+                if y_pos >= 0 && y_pos < display_height as i32 {
+                    *img.get_pixel_mut(x, y_pos as u32) = white;
+                }
+            }
+        }
+    }
+    
+    // Save PNG
+    let overlay_path = output_dir.join("selection_overlay.png");
+    img.save(&overlay_path).map_err(|e| e.to_string())?;
+    info!("Selection overlay PNG saved to {}", overlay_path.display());
+    
     Ok(())
 }
